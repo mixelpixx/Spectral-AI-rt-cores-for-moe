@@ -127,6 +127,8 @@ Each mechanism adds complementary disambiguation:
 
 The 7 failure cases (of 442) concentrate in rare domain-crossing contexts where the spectral color lacks discriminative features (e.g., "set" across mathematics and music).
 
+![Figure 1: Cumulative ablation of Spectral Routing mechanisms. Each optical component adds complementary disambiguation: Snell refraction (+7.8 pp), chromatic aberration (+13.6 pp), TIR (+3.1 pp), and phase coherence (+1.6 pp), reaching 98.4% total.](../figures/polysemy_ablation.png)
+
 ### 3.3 Computational Overhead
 
 | Configuration | Overhead |
@@ -135,6 +137,8 @@ The 7 failure cases (of 442) concentrate in rare domain-crossing contexts where 
 | Chromatic (B=4 bands) | < 0.12% of base BVH traversal |
 
 The overhead adds k x log(N) multiply-accumulate operations per step (k=256, log N ~ 17 for 100K tokens). Even at full multi-band cost, overhead is negligible relative to the O(N^2) -> O(N log N) reduction from BVH traversal itself.
+
+![Figure 2: Computational overhead of spectral routing components. Even the full 4-band chromatic configuration adds less than 0.12% overhead to the base BVH traversal cost.](../figures/spectral_overhead.png)
 
 ### 3.4 Failure Analysis
 

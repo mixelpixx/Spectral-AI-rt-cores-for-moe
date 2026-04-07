@@ -122,6 +122,8 @@ In-shader calibration via `optixCoopVecMatMul` eliminates the PyTorch round-trip
 
 15/16 layers exceed 93% top-8 accuracy. L15 best (97.58%), L8 most challenging (89.27%).
 
+![Figure 1: Per-layer BVH routing accuracy. Green bars indicate >96% accuracy, blue 93--96%, red <93%. Layer 8 is the most challenging due to its low expert selectivity (middle-layer trough). Mean accuracy: 95.95%.](../figures/per_layer_accuracy.png)
+
 ### 3.3 Perplexity
 
 | Configuration | PPL | Delta | Layers | Mode |
@@ -137,6 +139,8 @@ In-shader calibration via `optixCoopVecMatMul` eliminates the PyTorch round-trip
 
 *†Deltas against 20K-token baseline (6.69). \*Deltas against 50K-token baseline (7.15).*
 
+![Figure 2: Perplexity across routing configurations. Pre-filter mode (48 candidates) achieves only +1.5% PPL degradation while reducing search space by 1.3x. Pure 16-layer mode shows the accuracy compounding challenge (+27.4%).](../figures/ppl_comparison.png)
+
 **Pre-filter sweep (16 layers, 20K tokens):**
 
 | Candidates | PPL | Delta | Search Reduction |
@@ -146,6 +150,8 @@ In-shader calibration via `optixCoopVecMatMul` eliminates the PyTorch round-trip
 | 32 | 7.36 | +10.0% | 2.0x |
 | 48 | 6.79 | **+1.5%** | 1.3x |
 | 64 (baseline) | 6.69 | 0.0% | 1.0x |
+
+![Figure 4: Pre-filter candidate sweep. PPL (blue) drops sharply as candidates increase from 16 to 48, with diminishing returns beyond 48. The sweet spot (48 candidates) achieves only +1.5% PPL increase while reducing search by 1.3x.](../figures/prefilter_sweep.png)
 
 ### 3.4 Downstream: HellaSwag (N=2,000)
 
@@ -170,6 +176,8 @@ In-shader calibration via `optixCoopVecMatMul` eliminates the PyTorch round-trip
 | 256 | 1,412 | 10 | 139x |
 | 1024 | 2,371 | 10.9 | 218x |
 
+![Figure 3: RT Core routing speedup over PyTorch. Left: latency comparison on log scale showing 2+ orders of magnitude improvement. Right: speedup increases with batch size (113x at batch 1 to 218x at batch 1024).](../figures/rt_core_speedup.png)
+
 ### 3.6 Memory
 
 | Component | Size |
@@ -179,6 +187,8 @@ In-shader calibration via `optixCoopVecMatMul` eliminates the PyTorch round-trip
 | **Total active (router + 1 expert)** | **4.03 MB** |
 | Full model MLPs (dense 1.5B baseline) | 2,944 MB |
 | **VRAM reduction** | **731x** |
+
+![Figure 5: VRAM comparison between full dense MLPs (2,944 MB) and the BVH router + 1 active expert (4.03 MB), representing a 731x reduction.](../figures/vram_comparison.png)
 
 ### 3.7 Weight Mode Ablation (3-layer pure)
 

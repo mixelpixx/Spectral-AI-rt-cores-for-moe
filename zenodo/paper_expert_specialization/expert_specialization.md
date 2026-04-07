@@ -123,6 +123,8 @@ Top-10 most specialized experts per model:
 
 **No model produces a genuine topic specialist.** The maximum activation rate for any single topic ranges from 1.6x to 2.3x the uniform baseline. Even DeepSeek's "most specialized" expert (E34, casual_chat at 7.5%) activates for all 30 categories with near-uniform frequency. Notably, DeepSeek's top-10 includes punctuation and numbers_data -- further evidence of syntactic rather than semantic specialization.
 
+![Figure 1: Topic specialization is weak across all 3 models. The most specialized experts barely exceed the uniform baseline (dashed red line). Activation percentages remain close to the 3.3% uniform expectation for 30 categories.](../../figures/topic_specialization.png)
+
 ### 3.2 Syntactic Token Type Specialization
 
 In contrast to the weak topic specialization, all models show strong syntactic type differentiation. In OLMoE at layer 0, 49 of 64 experts are content-word dominant (>40% content_word tokens). Qwen and DeepSeek show the same pattern: experts cluster by their token type processing role rather than by semantic domain.
@@ -184,6 +186,8 @@ Per-layer selectivity -- DeepSeek-MoE (layers 1--12, GPU-resident):
 
 DeepSeek's selectivity declines monotonically from 0.832 (L3) to 0.429 (L11), consistent with the early-to-middle decline observed in OLMoE and Qwen. This confirms the descending half of the U-shaped curve across a third architecture. Late-layer data (L13--L27) was unavailable due to CPU offloading; with sufficient VRAM (32+ GB) or INT4 quantization, the full curve could be measured.
 
+![Figure 2: U-shaped expert selectivity across layers for all 3 MoE models. The x-axis is normalized to [0, 1] for cross-model comparison. All models show high selectivity at early layers, a trough in the middle, and recovery in late layers (where data is available).](../../figures/selectivity_u_shape.png)
+
 **Interpretation:** Early layers perform initial token categorization (distinguishing content from function words). Middle layers process more uniformly (contextual blending, semantic integration). Late layers re-specialize for output prediction (confirmed in OLMoE and Qwen).
 
 ### 3.4 Co-Activation Clusters Are Per-Layer
@@ -201,6 +205,8 @@ Co-activation analysis reveals that cluster structure varies by layer and is **n
 | OLMoE | 42.9% | 100.0% | 42.9--51.1% | L7--L9 (middle) |
 | Qwen | 23.1% | 96.7% | 23.1--31.4% | L11--L14 (middle) |
 | DeepSeek | 25.1% | 88.0% | 25.1--26.5% | L10--L12 (entering middle) |
+
+![Figure 3: Co-activation cluster stability between adjacent layers. Green indicates high stability (clusters persist), red indicates reorganization. All models show a stability trough in middle layers.](../../figures/cluster_stability.png)
 
 **Key finding:** In all three models, the stability trough coincides with the selectivity minimum and the cluster count maximum. This suggests that middle layers undergo a "reorganization phase" where expert roles become fluid before re-crystallizing in late layers.
 
