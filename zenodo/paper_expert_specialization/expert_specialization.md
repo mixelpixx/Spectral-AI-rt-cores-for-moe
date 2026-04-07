@@ -303,13 +303,16 @@ Hardware used: NVIDIA RTX 5070 Ti (16 GB VRAM), 32 GB system RAM, WSL2 on Window
 
 ```bash
 # OLMoE (~14 GB)
-python -c "from huggingface_hub import snapshot_download; snapshot_download('allenai/OLMoE-1B-7B-0924', local_dir='models/olmoe')"
+huggingface-cli download allenai/OLMoE-1B-7B-0924 \
+    --local-dir models/olmoe
 
 # Qwen1.5-MoE (~28 GB)
-python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen1.5-MoE-A2.7B', local_dir='models/qwen-moe')"
+huggingface-cli download Qwen/Qwen1.5-MoE-A2.7B \
+    --local-dir models/qwen-moe
 
 # DeepSeek-MoE (~32 GB)
-python -c "from huggingface_hub import snapshot_download; snapshot_download('deepseek-ai/deepseek-moe-16b-base', local_dir='models/deepseek-moe')"
+huggingface-cli download deepseek-ai/deepseek-moe-16b-base \
+    --local-dir models/deepseek-moe
 ```
 
 **Step 2: Run per-model analysis**
@@ -357,6 +360,8 @@ python python/analyze_experts_multi.py \
 
 Architecture detection is automatic for models using standard HuggingFace MoE patterns. The script detects gate module paths, expert counts, top-k values, MoE layer indices, and gate output format (raw logits vs. pre-computed top-k).
 
+\newpage
+
 ### 7.4 File Inventory
 
 | File | Purpose |
@@ -372,17 +377,21 @@ Architecture detection is automatic for models using standard HuggingFace MoE pa
 
 ---
 
+\newpage
+
 ## Data Availability
 
-All analysis data is publicly available in this repository:
+All analysis data is publicly available in this repository under `results/`:
 
-| Model | Catalog | Deep Analysis | Coverage |
-|---|---|---|---|
-| OLMoE-1B-7B | `results/olmoe/expert_catalog.json` | `results/olmoe/expert_deep_analysis.json` | 16/16 layers (100%) |
-| Qwen1.5-MoE-A2.7B | `results/qwen_moe/expert_catalog.json` | `results/qwen_moe/expert_deep_analysis.json` | 24/24 layers (100%) |
-| DeepSeek-MoE-16B | `results/deepseek_moe/expert_catalog.json` | `results/deepseek_moe/expert_deep_analysis.json` | 12/27 layers (44%) |
+| Model | Directory | Coverage |
+|---|---|---|
+| OLMoE-1B-7B | `results/olmoe/` | 16/16 layers (100%) |
+| Qwen1.5-MoE-A2.7B | `results/qwen_moe/` | 24/24 layers (100%) |
+| DeepSeek-MoE-16B | `results/deepseek_moe/` | 12/27 layers (44%) |
 
-Original single-model data (OLMoE): `results/expert_catalog_exhaustive.json`, `results/expert_deep_analysis.json`.
+Each directory contains `expert_catalog.json` and `expert_deep_analysis.json`.
+
+Original single-model OLMoE data: `results/expert_catalog_exhaustive.json`, `results/expert_deep_analysis.json`.
 
 ---
 

@@ -483,7 +483,7 @@ def fig_vram_comparison() -> None:
     labels = ["Full MLPs\n(dense, 1.5B)", "BVH Router\n+ 1 expert"]
     sizes_mb = [2944, 4.03]
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(7, 5))
 
     bars = ax.bar(range(len(labels)), sizes_mb,
                   color=["#e53935", "#4CAF50"], edgecolor="white",
@@ -491,17 +491,22 @@ def fig_vram_comparison() -> None:
 
     ax.set_yscale("log")
     ax.set_ylabel("VRAM (MB) — log scale")
-    ax.set_title("VRAM Usage: Dense MLPs vs BVH Router — 731× Reduction")
+    ax.set_title("VRAM Usage: Dense MLPs vs BVH Router — 731× Reduction",
+                 pad=15)
     ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels, fontsize=11)
+    ax.set_ylim(1, 8000)
 
-    for bar, val in zip(bars, sizes_mb):
-        ax.text(bar.get_x() + bar.get_width() / 2, val * 1.3,
-                f"{val:,.1f} MB" if val > 10 else f"{val:.2f} MB",
-                ha="center", va="bottom", fontsize=11, fontweight="bold")
+    # Labels INSIDE the bars to avoid title overlap
+    ax.text(bars[0].get_x() + bars[0].get_width() / 2, 1500,
+            "2,944 MB", ha="center", va="center",
+            fontsize=12, fontweight="bold", color="white")
+    ax.text(bars[1].get_x() + bars[1].get_width() / 2, 8,
+            "4.03 MB", ha="center", va="bottom",
+            fontsize=11, fontweight="bold", color="#2E7D32")
 
     # Draw the 731x arrow
-    ax.annotate("731×\nreduction", xy=(1, 4.03), xytext=(0.5, 100),
+    ax.annotate("731×\nreduction", xy=(1, 4.03), xytext=(0.5, 80),
                 fontsize=12, fontweight="bold", color="#1565C0",
                 ha="center",
                 arrowprops=dict(arrowstyle="->", color="#1565C0", lw=2))
