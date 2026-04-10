@@ -338,9 +338,15 @@ class TestGradientFlow:
 
     def test_gradients_flow_to_input_proj(self, default_router: EnhancedBVHRouter) -> None:
         default_router.train()
-        x = torch.randn(4, 2048)
+        torch.manual_seed(123)
+        x = torch.randn(16, 2048)
         probs, _ = default_router(x)
-        probs.sum().backward()
+        # Use cross-entropy loss against random targets for strong gradient signal.
+        # probs.sum() is degenerate because softmax rows always sum to ~1,
+        # making the total ~batch_size regardless of routing → zero gradients.
+        targets = torch.randint(0, 64, (16,))
+        loss = torch.nn.functional.cross_entropy(probs, targets)
+        loss.backward()
 
         assert default_router.input_proj[0].weight.grad is not None
         assert default_router.input_proj[0].weight.grad.abs().sum() > 0
