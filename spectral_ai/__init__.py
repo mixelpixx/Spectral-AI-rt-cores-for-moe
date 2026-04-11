@@ -54,12 +54,13 @@ _python_dir = Path(__file__).parent.parent / "python"
 if str(_python_dir) not in sys.path:
     sys.path.insert(0, str(_python_dir))
 
-from bvh_router import BVHRouter, RouterConfig, RoutingResult
+from bvh_router import BVHRouter, BranchSpecificBVHRouter, RouterConfig, RoutingResult
 from bvh_router_bridge import HybridBVHRouter
 from expert_lru_cache import ExpertLRUCache
 
 __all__ = [
     "BVHRouter",
+    "BranchSpecificBVHRouter",
     "RouterConfig",
     "RoutingResult",
     "HybridBVHRouter",

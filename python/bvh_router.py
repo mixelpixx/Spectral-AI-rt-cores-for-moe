@@ -342,6 +342,157 @@ class BVHRouter(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────
+# BranchSpecificBVHRouter — proyecciones 3D por rama (issue #3)
+# ─────────────────────────────────────────────────────────────────
+
+class BranchSpecificBVHRouter(nn.Module):
+    """
+    Router BVH con proyecciones 3D específicas por rama.
+
+    En lugar de una única proyección global (embed_dim → 3D),
+    cada rama del árbol BVH tiene su propia proyección aprendida:
+
+        Nivel 1 : 1  proyección global
+        Nivel 2 : n_level1 proyecciones          (4  por defecto)
+        Nivel 3 : n_level1 × n_level2 proyecciones (16 por defecto)
+        Total   : 21 proyecciones
+
+    Expresividad efectiva: 3³ = 27 dimensiones de routing relevantes
+    (vs 3D con proyección global).
+
+    Training : media ponderada de proyecciones (diferenciable).
+    Inferencia: selección hard de la rama activa (eficiente).
+
+    Ver: https://github.com/JordiSilvestre/Spectral-AI/issues/3
+    """
+
+    def __init__(self, cfg: RouterConfig):
+        super().__init__()
+        self.cfg = cfg
+
+        # Proyección global → nivel 1
+        self.to_3d = nn.Linear(cfg.embed_dim, 3)
+
+        # Proyecciones por rama → nivel 2 (una por rama L1)
+        self.to_3d_l2 = nn.ModuleList([
+            nn.Linear(cfg.embed_dim, 3) for _ in range(cfg.n_level1)
+        ])
+
+        # Proyecciones por rama → nivel 3 (una por rama L2)
+        self.to_3d_l3 = nn.ModuleList([
+            nn.Linear(cfg.embed_dim, 3) for _ in range(cfg.total_l2)
+        ])
+
+        # Codificación espectral
+        self.spectral = SpectralEncoder(cfg.embed_dim, cfg.spectral_dim)
+
+        # Niveles de routing
+        self.level1  = RouterLevel(cfg.n_level1, parent_spheres=1)
+        self.portal1 = AffinePortal(cfg.total_l1)
+        self.refract1 = PrismaticRefraction(cfg.total_l1, cfg.spectral_dim)
+
+        self.level2  = RouterLevel(cfg.n_level2, parent_spheres=cfg.total_l1)
+        self.refract2 = PrismaticRefraction(cfg.total_l2, cfg.spectral_dim)
+
+        self.level3  = RouterLevel(cfg.n_level3, parent_spheres=cfg.total_l2)
+        self.refract3 = PrismaticRefraction(cfg.total_l3, cfg.spectral_dim)
+
+        self.register_buffer('temperature',
+                             torch.tensor(cfg.temperature_init))
+        self.register_buffer('expert_counts',
+                             torch.zeros(cfg.n_experts))
+
+    def _branch_project(
+        self,
+        embedding: torch.Tensor,    # (B, D)
+        probs:     torch.Tensor,    # (B, K)
+        projs:     nn.ModuleList,   # K × Linear(D→3)
+    ) -> torch.Tensor:              # (B, 3)
+        """
+        Proyección diferenciable por rama.
+
+        Training  → media ponderada por probs (gradiente fluye a todas).
+        Inferencia → selección hard de la rama argmax (sin overhead).
+        """
+        # (B, K, 3)
+        all_proj = torch.stack([p(embedding) for p in projs], dim=1)
+
+        if self.training:
+            # Media ponderada: gradiente fluye a todas las ramas
+            return (all_proj * probs.unsqueeze(-1)).sum(dim=1)
+        else:
+            # Hard: sólo la rama activa
+            idx = probs.argmax(dim=-1)                         # (B,)
+            idx_exp = idx.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, 3)
+            return all_proj.gather(1, idx_exp).squeeze(1)      # (B, 3)
+
+    def anneal_temperature(self):
+        new_temp = max(self.cfg.temperature_min,
+                       self.temperature.item() * self.cfg.temperature_decay)
+        self.temperature.fill_(new_temp)
+
+    def reset_expert_counts(self):
+        self.expert_counts.zero_()
+
+    def forward(
+        self,
+        prompt_embedding: torch.Tensor,
+        hard: bool = False,
+    ) -> RoutingResult:
+        T        = self.temperature
+        use_hard = hard or not self.training
+
+        spectral = self.spectral(prompt_embedding)       # (B, spectral_dim)
+
+        # ── Nivel 1: proyección global ───────────────────────────
+        pos_3d = self.to_3d(prompt_embedding)            # (B, 3)
+        n1 = self.refract1(spectral)
+        p1, c1 = self.level1(pos_3d, T, hard=use_hard)
+        p1 = p1 * n1
+        p1 = p1 / (p1.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # Portal afín (mantiene compatibilidad con nivel 2 original)
+        all_l1 = self.portal1.apply_all(pos_3d)          # (B, K1, 3)
+        _      = (all_l1 * p1.unsqueeze(-1)).sum(dim=1)  # ignorado — usamos branch proj
+
+        # ── Nivel 2: proyección específica por rama L1 ───────────
+        pos_l1 = self._branch_project(prompt_embedding, p1, self.to_3d_l2)
+        n2 = self.refract2(spectral)
+        p2, c2 = self.level2(pos_l1, T, parent_choice=p1, hard=use_hard)
+        p2 = p2 * n2
+        p2 = p2 / (p2.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # ── Nivel 3: proyección específica por rama L2 ───────────
+        pos_l2 = self._branch_project(prompt_embedding, p2, self.to_3d_l3)
+        n3 = self.refract3(spectral)
+        p3, c3 = self.level3(pos_l2, T, parent_choice=p2, hard=use_hard)
+        p3 = p3 * n3
+        p3 = p3 / (p3.sum(dim=-1, keepdim=True) + 1e-8)
+
+        expert_id  = p3.argmax(dim=-1)
+        confidence = p3.max(dim=-1).values
+
+        if self.training:
+            for eid in expert_id:
+                self.expert_counts[eid] += 1
+
+        return RoutingResult(
+            expert_id   = expert_id,
+            expert_probs= p3,
+            route_path  = torch.stack([c1, c2, c3], dim=-1),
+            confidence  = confidence,
+        )
+
+    def load_balancing_loss(self) -> torch.Tensor:
+        total = self.expert_counts.sum()
+        if total < 1:
+            return torch.tensor(0.0, device=self.expert_counts.device)
+        usage  = self.expert_counts / total
+        target = 1.0 / self.cfg.n_experts
+        return ((usage - target) ** 2).sum()
+
+
+# ─────────────────────────────────────────────────────────────────
 # Test rápido
 # ─────────────────────────────────────────────────────────────────
 
