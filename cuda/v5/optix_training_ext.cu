@@ -354,6 +354,93 @@ void shutdown_impl() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Cooperative Vector Calibration (OptiX 9.0+)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if the current GPU supports OptiX Cooperative Vectors.
+ * Required for in-shader calibration on Tensor Cores.
+ *
+ * Returns: true if CoopVec is supported
+ */
+bool is_coopvec_supported_impl() {
+    if (!g_initialized || !g_router) {
+        return false;
+    }
+    return g_router->isCoopVecSupported();
+}
+
+/**
+ * Upload affine calibration weights: calibrated[i] = logits[i] * scale[i] + bias[i]
+ *
+ * Args:
+ *   scale: CPU tensor (num_experts,) float32
+ *   bias:  CPU tensor (num_experts,) float32
+ *
+ * Returns: true on success
+ */
+bool upload_calibration_affine_impl(torch::Tensor scale, torch::Tensor bias) {
+    if (!g_initialized || !g_router) {
+        throw std::runtime_error("Call initialize() first");
+    }
+
+    check_tensor(scale, "scale", torch::kFloat32, /*require_cuda=*/false);
+    check_tensor(bias, "bias", torch::kFloat32, /*require_cuda=*/false);
+    TORCH_CHECK(scale.dim() == 1, "scale must be 1D");
+    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+    TORCH_CHECK(scale.size(0) == bias.size(0), "scale and bias must have same size");
+
+    uint32_t n = static_cast<uint32_t>(scale.size(0));
+    return g_router->uploadCalibrationAffine(
+        scale.data_ptr<float>(), bias.data_ptr<float>(), n);
+}
+
+/**
+ * Upload linear calibration: calibrated = W @ logits + bias.
+ * Uses optixCoopVecMatrixConvert for INFERENCING_OPTIMAL layout.
+ *
+ * Args:
+ *   W:    CPU tensor (N, K) float32 — calibration weight matrix
+ *   bias: CPU tensor (N,)   float32 — calibration bias vector
+ *
+ * Returns: true on success
+ */
+bool upload_calibration_linear_impl(torch::Tensor W, torch::Tensor bias) {
+    if (!g_initialized || !g_router) {
+        throw std::runtime_error("Call initialize() first");
+    }
+
+    check_tensor(W, "W", torch::kFloat32, /*require_cuda=*/false);
+    check_tensor(bias, "bias", torch::kFloat32, /*require_cuda=*/false);
+    TORCH_CHECK(W.dim() == 2, "W must be 2D");
+    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+    TORCH_CHECK(W.size(0) == bias.size(0), "W rows must match bias size");
+
+    uint32_t N = static_cast<uint32_t>(W.size(0));
+    uint32_t K = static_cast<uint32_t>(W.size(1));
+
+    return g_router->uploadCalibrationLinear(
+        W.data_ptr<float>(), bias.data_ptr<float>(), N, K);
+}
+
+/**
+ * Disable calibration (pass-through mode).
+ */
+bool disable_calibration_impl() {
+    if (!g_initialized || !g_router) {
+        return false;
+    }
+    return g_router->disableCalibration();
+}
+
+/**
+ * Check if calibration weights are currently uploaded.
+ */
+bool has_calibration_impl() {
+    return g_initialized && g_router && g_router->hasCalibration();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Pybind11 module registration
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -405,4 +492,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("shutdown", &shutdown_impl,
           "Release OptiX resources");
+
+    // ── Cooperative Vector Calibration (OptiX 9.0+) ──────────────────
+    m.def("is_coopvec_supported", &is_coopvec_supported_impl,
+          "Check if GPU supports OptiX Cooperative Vectors for Tensor Core calibration");
+
+    m.def("upload_calibration_affine", &upload_calibration_affine_impl,
+          "Upload affine calibration: calibrated[i] = logits[i] * scale[i] + bias[i]",
+          py::arg("scale"), py::arg("bias"));
+
+    m.def("upload_calibration_linear", &upload_calibration_linear_impl,
+          "Upload linear calibration: calibrated = W @ logits + bias (uses Tensor Cores)",
+          py::arg("W"), py::arg("bias"));
+
+    m.def("disable_calibration", &disable_calibration_impl,
+          "Disable calibration (pass-through mode)");
+
+    m.def("has_calibration", &has_calibration_impl,
+          "Check if calibration weights are uploaded");
 }

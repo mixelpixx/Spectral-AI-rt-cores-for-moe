@@ -17,6 +17,7 @@
 #include <optix_function_table_definition.h>  // Defines g_optixFunctionTable symbol
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>   // half type for CoopVec FP16 calibration
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -62,6 +63,42 @@
             return false;                                                         \
         }                                                                        \
     } while (0)
+
+// ============================================================================
+// Cooperative Vector Calibration Types (OptiX 9.0+)
+// ============================================================================
+
+/// Max number of experts in the MoE router (128 for Gemma 4, 64 for OLMoE)
+static constexpr uint32_t SPECTRAL_NUM_EXPERTS = 128;
+
+/// Calibration mode selector — matches device-side enum in optical_attention.h
+enum HostCalibrationMode : uint32_t {
+    HOST_CALIBRATION_MODE_NONE   = 0,  ///< No calibration
+    HOST_CALIBRATION_MODE_AFFINE = 1,  ///< Per-expert scale + bias (128 params)
+    HOST_CALIBRATION_MODE_LINEAR = 2,  ///< Full linear W[64x64] + bias (4160 params)
+};
+
+/**
+ * @struct HostCalibrationWeights
+ * @brief Host-side calibration weights struct. Uploaded to device memory.
+ *
+ * Layout must match the CalibrationWeights struct in optical_attention.h.
+ * The linear_matrix_ptr points to a separate buffer containing the matrix
+ * in INFERENCING_OPTIMAL layout (computed by optixCoopVecMatrixConvert).
+ */
+struct alignas(64) HostCalibrationWeights {
+    uint32_t mode;          ///< HostCalibrationMode
+    uint32_t _pad[3];       ///< Padding for 16-byte alignment
+
+    half affine_scale[SPECTRAL_NUM_EXPERTS];  ///< 128 bytes
+    half affine_bias[SPECTRAL_NUM_EXPERTS];   ///< 128 bytes
+
+    CUdeviceptr linear_matrix_ptr;    ///< Device pointer to W[64x64] in optimal layout
+    uint32_t    linear_matrix_size;   ///< Size in bytes
+    uint32_t    _pad2;
+
+    half linear_bias[SPECTRAL_NUM_EXPERTS];   ///< 128 bytes
+};
 
 // ============================================================================
 // RTRouterParams — must match device-side struct in optix_router_raygen.cu
@@ -802,6 +839,231 @@ public:
     size_t gasSize() const { return gas_size_bytes_; }
     uint32_t numExperts() const { return num_experts_; }
 
+    // ========================================================================
+    // Cooperative Vector Calibration (OptiX 9.0+)
+    // ========================================================================
+
+    /**
+     * Query if the current device supports OptiX Cooperative Vectors.
+     * Required for in-shader calibration via Tensor Cores.
+     *
+     * @return true if CoopVec is supported on the current GPU
+     */
+    bool isCoopVecSupported() const {
+        if (!optix_context_) return false;
+        unsigned int flags = 0;
+        OptixResult res = optixDeviceContextGetProperty(
+            optix_context_,
+            OPTIX_DEVICE_PROPERTY_COOP_VEC,
+            &flags, sizeof(flags));
+        return (res == OPTIX_SUCCESS) &&
+               (flags & OPTIX_DEVICE_PROPERTY_COOP_VEC_FLAG_STANDARD);
+    }
+
+    /**
+     * Upload affine calibration weights (scale + bias per expert).
+     * calibrated[i] = logits[i] * scale[i] + bias[i]
+     *
+     * @param scale  FP32 scale values [num_experts] (host memory)
+     * @param bias   FP32 bias values [num_experts] (host memory)
+     * @param num_experts Number of experts
+     * @return true on success
+     */
+    bool uploadCalibrationAffine(const float* scale, const float* bias,
+                                 uint32_t num_experts) {
+        if (!optix_context_) {
+            std::cerr << "[RTRouter] Cannot upload calibration: not initialized"
+                      << std::endl;
+            return false;
+        }
+
+        if (num_experts > SPECTRAL_NUM_EXPERTS) {
+            std::cerr << "[RTRouter] num_experts exceeds SPECTRAL_NUM_EXPERTS"
+                      << std::endl;
+            return false;
+        }
+
+        // Prepare host-side struct
+        HostCalibrationWeights h_cal = {};
+        h_cal.mode = HOST_CALIBRATION_MODE_AFFINE;
+
+        // Convert FP32 → FP16 for affine scale and bias
+        for (uint32_t i = 0; i < num_experts; ++i) {
+            h_cal.affine_scale[i] = __float2half(scale[i]);
+            h_cal.affine_bias[i]  = __float2half(bias[i]);
+        }
+
+        // Zero-fill remaining experts (if num_experts < 64)
+        for (uint32_t i = num_experts; i < SPECTRAL_NUM_EXPERTS; ++i) {
+            h_cal.affine_scale[i] = __float2half(1.0f);  // identity scale
+            h_cal.affine_bias[i]  = __float2half(0.0f);  // zero bias
+        }
+
+        h_cal.linear_matrix_ptr = 0;
+        h_cal.linear_matrix_size = 0;
+
+        // Upload to device
+        return uploadCalibrationToDevice(h_cal);
+    }
+
+    /**
+     * Upload linear calibration weights: calibrated = W @ logits + bias.
+     * Uses optixCoopVecMatrixConvert to convert the weight matrix from
+     * row-major FP16 to INFERENCING_OPTIMAL layout on the GPU.
+     *
+     * @param W_fp32    Weight matrix [N x K] in row-major FP32 (host memory)
+     * @param bias_fp32 Bias vector [N] in FP32 (host memory)
+     * @param N         Output dimension (num_experts = 64)
+     * @param K         Input dimension  (num_experts = 64)
+     * @return true on success
+     */
+    bool uploadCalibrationLinear(const float* W_fp32, const float* bias_fp32,
+                                 uint32_t N, uint32_t K) {
+        if (!optix_context_) {
+            std::cerr << "[RTRouter] Cannot upload calibration: not initialized"
+                      << std::endl;
+            return false;
+        }
+
+        if (!isCoopVecSupported()) {
+            std::cerr << "[RTRouter] CoopVec not supported on this device. "
+                         "Falling back to no calibration." << std::endl;
+            return false;
+        }
+
+        if (N > SPECTRAL_NUM_EXPERTS || K > SPECTRAL_NUM_EXPERTS) {
+            std::cerr << "[RTRouter] Matrix dimensions exceed SPECTRAL_NUM_EXPERTS"
+                      << std::endl;
+            return false;
+        }
+
+        // ── Step 1: Compute required size for INFERENCING_OPTIMAL layout ──
+        size_t optimal_size = 0;
+        OPTIX_CHECK(optixCoopVecMatrixComputeSize(
+            optix_context_,
+            N, K,
+            OPTIX_COOP_VEC_ELEM_TYPE_FLOAT16,
+            OPTIX_COOP_VEC_MATRIX_LAYOUT_INFERENCING_OPTIMAL,
+            0,  // rowColumnStrideInBytes (ignored for optimal layouts)
+            &optimal_size));
+
+        std::cout << "[RTRouter] CoopVec matrix size: " << N << "x" << K
+                  << " FP16 INFERENCING_OPTIMAL = " << optimal_size
+                  << " bytes" << std::endl;
+
+        // ── Step 2: Convert W_fp32 to row-major FP16 on host ──
+        size_t rowmajor_size_per_element = sizeof(half);
+        size_t rowmajor_stride = K * rowmajor_size_per_element;
+        size_t rowmajor_total = N * rowmajor_stride;
+
+        std::vector<half> h_W_fp16(N * K);
+        for (uint32_t i = 0; i < N * K; ++i) {
+            h_W_fp16[i] = __float2half(W_fp32[i]);
+        }
+
+        // ── Step 3: Upload ROW_MAJOR FP16 matrix to device ──
+        CUdeviceptr d_W_rowmajor = 0;
+        // Align to 64 bytes
+        size_t aligned_rowmajor = ((rowmajor_total + 63) / 64) * 64;
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_W_rowmajor),
+                              aligned_rowmajor));
+        CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(d_W_rowmajor),
+                              h_W_fp16.data(), rowmajor_total,
+                              cudaMemcpyHostToDevice));
+
+        // ── Step 4: Allocate INFERENCING_OPTIMAL buffer on device ──
+        if (d_calibration_matrix_) {
+            cudaFree(reinterpret_cast<void*>(d_calibration_matrix_));
+        }
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_calibration_matrix_),
+                              optimal_size));
+
+        // ── Step 5: Convert ROW_MAJOR → INFERENCING_OPTIMAL via OptiX ──
+        OptixCoopVecMatrixDescription input_desc = {};
+        input_desc.N = N;
+        input_desc.K = K;
+        input_desc.offsetInBytes = 0;
+        input_desc.elementType = OPTIX_COOP_VEC_ELEM_TYPE_FLOAT16;
+        input_desc.layout = OPTIX_COOP_VEC_MATRIX_LAYOUT_ROW_MAJOR;
+        input_desc.rowColumnStrideInBytes = static_cast<unsigned int>(rowmajor_stride);
+        input_desc.sizeInBytes = static_cast<unsigned int>(rowmajor_total);
+
+        OptixCoopVecMatrixDescription output_desc = {};
+        output_desc.N = N;
+        output_desc.K = K;
+        output_desc.offsetInBytes = 0;
+        output_desc.elementType = OPTIX_COOP_VEC_ELEM_TYPE_FLOAT16;
+        output_desc.layout = OPTIX_COOP_VEC_MATRIX_LAYOUT_INFERENCING_OPTIMAL;
+        output_desc.rowColumnStrideInBytes = 0;  // ignored for optimal
+        output_desc.sizeInBytes = static_cast<unsigned int>(optimal_size);
+
+        OptixNetworkDescription input_net = {};
+        input_net.layers = &input_desc;
+        input_net.numLayers = 1;
+
+        OptixNetworkDescription output_net = {};
+        output_net.layers = &output_desc;
+        output_net.numLayers = 1;
+
+        OPTIX_CHECK(optixCoopVecMatrixConvert(
+            optix_context_,
+            0,              // stream
+            1,              // numNetworks
+            &input_net,
+            d_W_rowmajor,
+            0,              // inputNetworkStrideInBytes (ignored for 1 network)
+            &output_net,
+            d_calibration_matrix_,
+            0               // outputNetworkStrideInBytes
+        ));
+
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Free temporary row-major buffer
+        cudaFree(reinterpret_cast<void*>(d_W_rowmajor));
+
+        std::cout << "[RTRouter] CoopVec matrix converted to INFERENCING_OPTIMAL"
+                  << std::endl;
+
+        // ── Step 6: Build CalibrationWeights struct with linear mode ──
+        HostCalibrationWeights h_cal = {};
+        h_cal.mode = HOST_CALIBRATION_MODE_LINEAR;
+
+        // Also set affine to identity (in case shader checks both)
+        for (uint32_t i = 0; i < SPECTRAL_NUM_EXPERTS; ++i) {
+            h_cal.affine_scale[i] = __float2half(1.0f);
+            h_cal.affine_bias[i]  = __float2half(0.0f);
+        }
+
+        h_cal.linear_matrix_ptr = d_calibration_matrix_;
+        h_cal.linear_matrix_size = static_cast<uint32_t>(optimal_size);
+
+        // Convert bias FP32 → FP16
+        for (uint32_t i = 0; i < N; ++i) {
+            h_cal.linear_bias[i] = __float2half(bias_fp32[i]);
+        }
+        for (uint32_t i = N; i < SPECTRAL_NUM_EXPERTS; ++i) {
+            h_cal.linear_bias[i] = __float2half(0.0f);
+        }
+
+        return uploadCalibrationToDevice(h_cal);
+    }
+
+    /**
+     * Disable calibration (pass-through mode).
+     */
+    bool disableCalibration() {
+        HostCalibrationWeights h_cal = {};
+        h_cal.mode = HOST_CALIBRATION_MODE_NONE;
+        return uploadCalibrationToDevice(h_cal);
+    }
+
+    /**
+     * Check if calibration weights are currently uploaded.
+     */
+    bool hasCalibration() const { return d_calibration_weights_ != 0; }
+    HostCalibrationMode getCalibrationMode() const { return calibration_mode_; }
+
 private:
     bool buildSBT() {
         // ── Raygen SBT ─────────────────────────────────────────
@@ -844,6 +1106,34 @@ private:
         return true;
     }
 
+    /**
+     * Upload calibration weights struct to device memory.
+     * Internal helper used by uploadCalibrationAffine/Linear.
+     */
+    bool uploadCalibrationToDevice(const HostCalibrationWeights& h_cal) {
+        if (!d_calibration_weights_) {
+            // First upload: allocate device memory (64-byte aligned)
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_calibration_weights_),
+                                  sizeof(HostCalibrationWeights)));
+        }
+
+        CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(d_calibration_weights_),
+                              &h_cal, sizeof(HostCalibrationWeights),
+                              cudaMemcpyHostToDevice));
+
+        calibration_mode_ = static_cast<HostCalibrationMode>(h_cal.mode);
+
+        const char* mode_name = "NONE";
+        if (h_cal.mode == HOST_CALIBRATION_MODE_AFFINE) mode_name = "AFFINE";
+        if (h_cal.mode == HOST_CALIBRATION_MODE_LINEAR) mode_name = "LINEAR";
+
+        std::cout << "[RTRouter] Calibration uploaded: mode=" << mode_name
+                  << " (" << sizeof(HostCalibrationWeights) << " bytes)"
+                  << std::endl;
+
+        return true;
+    }
+
     void cleanup() {
         // Sync stream before destroying anything
         if (stream_) {
@@ -865,6 +1155,10 @@ private:
         if (d_hitgroup_record_) cudaFree(reinterpret_cast<void*>(d_hitgroup_record_));
         if (d_params_) cudaFree(reinterpret_cast<void*>(d_params_));
         if (d_gas_buffer_) cudaFree(reinterpret_cast<void*>(d_gas_buffer_));
+
+        // CoopVec calibration resources
+        if (d_calibration_weights_) cudaFree(reinterpret_cast<void*>(d_calibration_weights_));
+        if (d_calibration_matrix_) cudaFree(reinterpret_cast<void*>(d_calibration_matrix_));
     }
 
     // State
@@ -899,6 +1193,11 @@ private:
 
     // Dedicated CUDA stream for async execution
     cudaStream_t stream_ = nullptr;
+
+    // CoopVec calibration weights in device memory
+    CUdeviceptr d_calibration_weights_ = 0;
+    CUdeviceptr d_calibration_matrix_ = 0;  // INFERENCING_OPTIMAL matrix buffer
+    HostCalibrationMode calibration_mode_ = HOST_CALIBRATION_MODE_NONE;
 };
 
 // ============================================================================

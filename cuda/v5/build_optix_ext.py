@@ -418,7 +418,8 @@ def build_optix_training_ext() -> bool:
     print(f"\n{'='*70}")
     print("Extension compiled successfully!")
     print(f"Module: {ext}")
-    print(f"Functions: initialize, build_gas, route, route_topk, is_ready, shutdown")
+    _funcs = [f for f in dir(ext) if not f.startswith('_')]
+    print(f"Functions: {', '.join(_funcs)}")
     print(f"{'='*70}")
 
     # Register in sys.modules so `import optix_training_ext` works

@@ -1423,6 +1423,13 @@ def main():
     parser.add_argument("--expert-perm", type=str, default=None,
                         help="JSON file with per-layer expert permutation from "
                              "co-activation analysis. Maps tree positions to expert IDs.")
+    parser.add_argument("--branch-specific", action="store_true",
+                        help="Use BranchSpecificBVHRouter (21 projections, 3^3=27D effective). "
+                             "Better expert utilization (63/64 vs 28/64).")
+    parser.add_argument("--n-experts", type=int, default=64,
+                        help="Number of experts in the MoE model (64=OLMoE, 128=Gemma4)")
+    parser.add_argument("--embed-dim", type=int, default=2048,
+                        help="Hidden dimension of the model (2048=OLMoE, 2816=Gemma4)")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -1445,19 +1452,56 @@ def main():
         print(f"\n[Step 1] Skipping model load (--real-data provided + --no-upcycle)")
 
     # Step 2: Create router
+    n_experts = args.n_experts
+    embed_dim = args.embed_dim
+
+    # Infer BVH tree structure from n_experts
+    if n_experts == 64:
+        n_l1, n_l2, n_l3 = 4, 4, 4    # 4×4×4 = 64
+    elif n_experts == 128:
+        n_l1, n_l2, n_l3 = 8, 4, 4    # 8×4×4 = 128
+    elif n_experts == 256:
+        n_l1, n_l2, n_l3 = 4, 8, 8    # 4×8×8 = 256
+    else:
+        # Generic: try cube root factorization
+        import math
+        cr = round(n_experts ** (1/3))
+        n_l1, n_l2, n_l3 = cr, cr, n_experts // (cr * cr)
+        assert n_l1 * n_l2 * n_l3 == n_experts, \
+            f"Cannot factorize {n_experts} into 3 levels. Use --n-experts 64/128/256."
+
     if args.mlp_baseline:
         print(f"\n[Step 2] Creating MLP Baseline Router (sanity check)...")
-        router = MLPBaselineRouter(input_dim=2048, n_experts=64, temperature_init=1.0)
+        router = MLPBaselineRouter(input_dim=embed_dim, n_experts=n_experts,
+                                   temperature_init=1.0)
         n_params = sum(p.numel() for p in router.parameters())
         print(f"  MLP params: {n_params:,}")
+    elif args.branch_specific:
+        from bvh_router import BranchSpecificBVHRouter, RouterConfig
+        spectral_str = f" + Spectral (dim={args.spectral_dim})" if args.spectral else ""
+        tree_str = f"{n_l1}x{n_l2}x{n_l3}"
+        print(f"\n[Step 2] Creating BranchSpecific BVH Router ({tree_str} = {n_experts} experts){spectral_str}...")
+        cfg = RouterConfig(
+            embed_dim=embed_dim,
+            n_level1=n_l1,
+            n_level2=n_l2,
+            n_level3=n_l3,
+            spectral_dim=args.spectral_dim,
+        )
+        router = BranchSpecificBVHRouter(cfg)
+        n_params = sum(p.numel() for p in router.parameters())
+        print(f"  BranchSpecific params: {n_params:,}")
+        print(f"  Projections: 1 (L1) + {n_l1} (L2) + {n_l1*n_l2} (L3) = {1+n_l1+n_l1*n_l2}")
+        print(f"  Effective routing dims: 3^3 = 27D")
     else:
         spectral_str = f" + Spectral (dim={args.spectral_dim})" if args.spectral else ""
-        print(f"\n[Step 2] Creating Enhanced BVH Router (4x4x4 = 64 experts){spectral_str}...")
+        tree_str = f"{n_l1}x{n_l2}x{n_l3}"
+        print(f"\n[Step 2] Creating Enhanced BVH Router ({tree_str} = {n_experts} experts){spectral_str}...")
         router = EnhancedBVHRouter(
-            input_dim=2048,
-            n_level1=4,
-            n_level2=4,
-            n_level3=4,
+            input_dim=embed_dim,
+            n_level1=n_l1,
+            n_level2=n_l2,
+            n_level3=n_l3,
             feature_dim=128,
             temperature_init=1.0,
             spectral_mode=args.spectral,
